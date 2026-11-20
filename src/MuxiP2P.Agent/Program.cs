@@ -23,6 +23,9 @@ internal static class Program
     {
         Console.OutputEncoding = Encoding.UTF8;
 
+        // `muxi-p2p-agent connect ...`: the connecting side as a local port forwarder (Connect.cs).
+        if (args.Length > 0 && args[0] == "connect") return await Connect.RunAsync(args[1..]).ConfigureAwait(false);
+
         var listenPort = int.Parse(Value(args, "--port") ?? "25540");
         var target = Value(args, "--target") ?? "127.0.0.1:25565";
         var token = Value(args, "--token") ?? Environment.GetEnvironmentVariable("MUXI_TUNNEL_TOKEN");
@@ -40,7 +43,19 @@ internal static class Program
         // 双栈监听：IPv6 直连和 IPv4 中继回来的流量都落在同一个端口上。
         var listener = new TcpListener(IPAddress.IPv6Any, listenPort);
         listener.Server.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, false);
-        listener.Start(128);
+        try
+        {
+            listener.Start(128);
+        }
+        catch (SocketException error) when (error.SocketErrorCode == SocketError.AddressAlreadyInUse && listenPort != 0)
+        {
+            // Another agent (or anything) holds the preferred port: take any, and report that one.
+            Log($"端口 {listenPort} 已被占用，改用系统分配的端口");
+            listener = new TcpListener(IPAddress.IPv6Any, 0);
+            listener.Server.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, false);
+            listener.Start(128);
+        }
+        listenPort = ((IPEndPoint)listener.LocalEndpoint).Port;
 
         Log($"隧道服务端已监听 [::]:{listenPort}（双栈）");
         Log($"本地目标 {targetHost}:{targetPort}");
@@ -311,7 +326,7 @@ internal static class Program
         }
     }
 
-    private static string? Value(string[] args, string name)
+    internal static string? Value(string[] args, string name)
     {
         var index = Array.FindIndex(args, a => a.Equals(name, StringComparison.OrdinalIgnoreCase));
         return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;

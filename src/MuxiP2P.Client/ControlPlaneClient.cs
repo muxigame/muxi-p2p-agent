@@ -40,6 +40,19 @@ public static class ControlPlaneClient
         Timeout = System.Threading.Timeout.InfiniteTimeSpan,
     };
 
+    /// <summary>
+    /// Headers sent with every control-plane request from this process -- for a control plane
+    /// embedded in a host that authenticates its callers (e.g. a device credential).
+    /// </summary>
+    public static void SetHeaders(IEnumerable<KeyValuePair<string, string>> headers)
+    {
+        foreach (var (name, value) in headers)
+        {
+            Http.DefaultRequestHeaders.Remove(name);
+            Http.DefaultRequestHeaders.TryAddWithoutValidation(name, value);
+        }
+    }
+
     public static async Task<ControlPlaneSnapshot?> FetchAsync(
         string baseUrl, string serverId, TimeSpan timeout, CancellationToken ct)
     {

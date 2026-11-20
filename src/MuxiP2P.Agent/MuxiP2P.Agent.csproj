@@ -15,5 +15,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../MuxiP2P.Protocol/MuxiP2P.Protocol.csproj" />
+    <ProjectReference Include="../MuxiP2P.Client/MuxiP2P.Client.csproj" />
   </ItemGroup>
 </Project>
