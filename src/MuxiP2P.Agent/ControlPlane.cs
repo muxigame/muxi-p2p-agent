@@ -153,12 +153,56 @@ internal sealed class ControlPlane
     /// 排序上稳定后缀的 IPv6 排在临时后缀前面：临时地址会轮换，客户端拿到的候选
     /// 活得越久越好。
     /// </summary>
+    /// <summary>
+    /// (deprecated, temporary) for an IPv6 address. Windows reports them on the address
+    /// (AddressPreferredLifetime, SuffixOrigin); on Linux those properties throw
+    /// PlatformNotSupportedException -- which made every registration fail there -- so the kernel's
+    /// own flags from /proc/net/if_inet6 are used instead (IFA_F_TEMPORARY 0x01, IFA_F_DEPRECATED 0x20).
+    /// </summary>
+    private static (bool Deprecated, bool Temporary) V6Flags(
+        UnicastIPAddressInformation info, IPAddress address, Dictionary<string, int>? linuxFlags)
+    {
+        if (linuxFlags is not null)
+        {
+            var key = Convert.ToHexString(address.GetAddressBytes()).ToLowerInvariant();
+            return linuxFlags.TryGetValue(key, out var flags) ? ((flags & 0x20) != 0, (flags & 0x01) != 0) : (false, false);
+        }
+        try
+        {
+            return (info.AddressPreferredLifetime == 0, info.SuffixOrigin == SuffixOrigin.Random);
+        }
+        catch (PlatformNotSupportedException)
+        {
+            return (false, false);
+        }
+    }
+
+    private static Dictionary<string, int>? LinuxV6Flags()
+    {
+        try
+        {
+            var flags = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var line in File.ReadLines("/proc/net/if_inet6"))
+            {
+                var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 5 && parts[0].Length == 32)
+                    flags[parts[0].ToLowerInvariant()] = Convert.ToInt32(parts[4], 16);
+            }
+            return flags;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or FormatException)
+        {
+            return null;
+        }
+    }
+
     private static List<string> LocalEndpoints()
     {
         var stable = new List<string>();
         var temporary = new List<string>();
         var lan = new List<string>();
         var seenSubnets = new HashSet<string>(StringComparer.Ordinal);
+        var linuxFlags = OperatingSystem.IsLinux() ? LinuxV6Flags() : null;
 
         foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
         {
@@ -176,10 +220,11 @@ internal sealed class ControlPlane
                 {
                     if (address.IsIPv6LinkLocal || address.IsIPv6SiteLocal ||
                         address.IsIPv6Multicast || address.IsIPv6Teredo) continue;
-                    if (info.AddressPreferredLifetime == 0) continue;
+                    var (deprecated, isTemporary) = V6Flags(info, address, linuxFlags);
+                    if (deprecated) continue;
 
                     var text = Clean(address);
-                    if (info.SuffixOrigin == SuffixOrigin.Random) temporary.Add(text);
+                    if (isTemporary) temporary.Add(text);
                     else stable.Add(text);
                 }
                 else if (address.AddressFamily == AddressFamily.InterNetwork)
