@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dotnet:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+          - os: windows-latest
+            rid: win-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+      - name: Build every project
+        shell: bash
+        run: |
+          set -eu
+          for project in src/*/*.csproj; do dotnet build "$project" -c Release; done
+      - name: Publish the agent
+        run: dotnet publish src/MuxiP2P.Agent/MuxiP2P.Agent.csproj -c Release -r ${{ matrix.rid }} -o out/${{ matrix.rid }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: muxi-p2p-agent-${{ matrix.rid }}
+          path: out/${{ matrix.rid }}/muxi-p2p-agent*
