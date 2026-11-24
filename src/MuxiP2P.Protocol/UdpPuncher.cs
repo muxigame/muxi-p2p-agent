@@ -205,7 +205,7 @@ public static class UdpPuncher
                 {
                     var extra = new Socket(
                         AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-                    extra.Bind(new IPEndPoint(IPAddress.Any, 0));
+                    extra.Bind(Egress.V4EndPoint(0));
                     SilenceIcmpResets(extra);
                     decoys.Add(extra);
                 }

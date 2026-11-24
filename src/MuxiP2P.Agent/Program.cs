@@ -22,6 +22,7 @@ internal static class Program
     private static async Task<int> Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
+        Egress.Log = message => Log(message);
 
         // `muxi-p2p-agent connect ...`: the connecting side as a local port forwarder (Connect.cs).
         if (args.Length > 0 && args[0] == "connect") return await Connect.RunAsync(args[1..]).ConfigureAwait(false);

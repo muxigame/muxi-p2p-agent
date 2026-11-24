@@ -34,6 +34,7 @@ internal static class Connect
             return 2;
         }
         ControlPlaneClient.SetHeaders(Headers(args));
+        Egress.Log = message => Emit(new { @event = "progress", text = message });
 
         using var lifetime = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; lifetime.Cancel(); };
@@ -117,16 +118,24 @@ internal static class Connect
     private static async Task<IMuxiTunnel?> EstablishAsync(
         string controlPlane, string serverId, string reflector, bool directOnly, CancellationToken ct)
     {
+        // 一次网络抖动（某条 IPv6 路径丢包、控制面前的 CDN 偶发失败）不该让整次连接失败：再取一次
         var token = await ControlPlaneClient.FetchClientTokenAsync(controlPlane, serverId, TimeSpan.FromSeconds(15), ct)
-            .ConfigureAwait(false) ?? throw new InvalidOperationException("the control plane gave no client token");
+                        .ConfigureAwait(false)
+                    ?? await ControlPlaneClient.FetchClientTokenAsync(controlPlane, serverId, TimeSpan.FromSeconds(15), ct)
+                        .ConfigureAwait(false)
+                    ?? throw new InvalidOperationException("取不到隧道凭据（控制面连不上或拒绝了这台设备）");
         var snapshot = await ControlPlaneClient.FetchAsync(controlPlane, serverId, TimeSpan.FromSeconds(15), ct)
             .ConfigureAwait(false) ?? throw new InvalidOperationException("the control plane is unreachable");
         if (!snapshot.Online) throw new InvalidOperationException("the device's tunnel agent is not registered");
 
         // 1. Direct: the agent's own addresses (IPv6, LAN, a router mapping), all at once.
         var direct = new List<Task<TunnelClient?>>();
+        var mine = OwnAddresses();
         foreach (var candidate in snapshot.Candidates.Where(c => c.Kind != RouteKind.Relay))
         {
+            // 对端公布的地址恰好也是本机的（两边都跑 docker 时的 172.18.0.1 之类）：连过去
+            // 只会连到自己身上的 agent，被它以"鉴权失败"拒掉。
+            if (IPAddress.TryParse(candidate.Host, out var literal) && mine.Contains(literal)) continue;
             direct.Add(TryDirectAsync(candidate, snapshot.TunnelPort, token, ct));
         }
         while (direct.Count > 0)
@@ -163,16 +172,34 @@ internal static class Connect
                     var timeout = TimeSpan.FromMilliseconds(candidate.ProbeTimeoutMs > 0 ? candidate.ProbeTimeoutMs : 2500);
                     return await TunnelClient.ConnectAsync(new IPEndPoint(address, tunnelPort), token, timeout, ct).ConfigureAwait(false);
                 }
-                catch (Exception error) when (error is SocketException or OperationCanceledException or IOException
-                                                  or InvalidDataException or TimeoutException)
+                catch (Exception error) when (!ct.IsCancellationRequested)
                 {
+                    // 这个地址不通，或者那头不是它（鉴权失败）：换下一个，别让整次连接失败
+                    Emit(new { @event = "progress", text = $"直连 {address} 未成功：{error.Message}" });
                 }
             }
         }
-        catch (Exception error) when (error is SocketException or OperationCanceledException or ArgumentException)
+        catch (Exception error) when (!ct.IsCancellationRequested
+                                      && error is SocketException or OperationCanceledException or ArgumentException)
         {
         }
         return null;
+    }
+
+    /// <summary>本机所有网卡上的地址。</summary>
+    private static HashSet<IPAddress> OwnAddresses()
+    {
+        var own = new HashSet<IPAddress>();
+        try
+        {
+            foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+            foreach (var info in nic.GetIPProperties().UnicastAddresses)
+                own.Add(info.Address);
+        }
+        catch (System.Net.NetworkInformation.NetworkInformationException)
+        {
+        }
+        return own;
     }
 
     private static async Task PipeAsync(TcpClient client, IMuxiTunnel tunnel, CancellationToken ct)

@@ -19,7 +19,7 @@ internal sealed class ControlPlane
 {
     private static readonly TimeSpan RegisterInterval = TimeSpan.FromSeconds(30);
 
-    private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(15) };
+    private readonly HttpClient _http = Egress.NewHttpClient(TimeSpan.FromSeconds(15));
     private readonly string _baseUrl;
     private readonly string _serverId;
     private readonly byte[] _secret;
@@ -103,13 +103,6 @@ internal sealed class ControlPlane
     /// 公布出去等于给客户端一条马上要失效的线路。内网地址保留——同局域网的玩家
     /// 用得上，客户端那边按 LanDirect 排在最前。
     /// </summary>
-    /// <summary>虚拟网卡的常见名字。公布它们的地址只会让客户端白白探测。</summary>
-    private static readonly string[] VirtualHints =
-    [
-        "hyper-v", "virtual", "vmware", "virtualbox", "vethernet", "wsl", "docker",
-        "tap-", "tun", "meta", "mihomo", "clash", "wintun", "zerotier", "tailscale",
-        "loopback", "teredo", "isatap",
-    ];
 
     /// <summary>
     /// 分类别限额，而不是一刀切取前 N 个。
@@ -121,11 +114,9 @@ internal sealed class ControlPlane
     private const int MaxTemporaryV6 = 1;
     private const int MaxLan = 2;
 
-    private static bool LooksVirtual(NetworkInterface nic)
-    {
-        var haystack = (nic.Name + " " + nic.Description).ToLowerInvariant();
-        return VirtualHints.Any(hint => haystack.Contains(hint, StringComparison.Ordinal));
-    }
+    /// <summary>虚拟网卡（容器网桥、虚拟机、VPN）：公布它们的地址只会让客户端白白探测，
+    /// 两边都跑 docker 时还会连到客户端自己身上。见 <see cref="Egress.LooksVirtual"/>。</summary>
+    private static bool LooksVirtual(NetworkInterface nic) => Egress.LooksVirtual(nic);
 
     /// <summary>
     /// 这些 IPv4 段绝不能公布：

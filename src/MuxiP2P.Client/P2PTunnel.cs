@@ -110,7 +110,7 @@ public sealed class P2PTunnel : IMuxiTunnel
         var tcpPort = tcpEnabled ? ReserveTcpPort() : 0;
         try
         {
-            udp.Bind(new IPEndPoint(IPAddress.Any, 0));
+            udp.Bind(Egress.V4EndPoint(0));
             var udpPort = ((IPEndPoint)udp.LocalEndPoint!).Port;
 
             progress?.Report("正在探测本机公网出口");
@@ -124,6 +124,18 @@ public sealed class P2PTunnel : IMuxiTunnel
                     .DiscoverAsync(udp, reflectorHost, ReflectorPorts, DiscoveryRounds, ct)
                     .ConfigureAwait(false)
                 : new NatDiscovery.Result([], 0, 0, false);
+            if (quicOk && discovery.Candidates.Count == 0 && !((IPEndPoint)udp.LocalEndPoint!).Address.Equals(IPAddress.Any))
+            {
+                // 绑物理网卡（绕开 VPN）探不到出口：这台机器只能经 VPN 出网，回退再探一次
+                udp.Close();
+                Egress.PhysicalUnreachable(TimeSpan.FromMinutes(5));
+                udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                udp.Bind(new IPEndPoint(IPAddress.Any, 0));
+                udpPort = ((IPEndPoint)udp.LocalEndPoint!).Port;
+                discovery = await NatDiscovery
+                    .DiscoverAsync(udp, reflectorHost, ReflectorPorts, DiscoveryRounds, ct)
+                    .ConfigureAwait(false);
+            }
 
             if (discovery.Candidates.Count > 0)
             {
@@ -542,7 +554,7 @@ public sealed class P2PTunnel : IMuxiTunnel
     {
         using var probe = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         probe.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        probe.Bind(new IPEndPoint(IPAddress.Any, 0));
+        probe.Bind(Egress.V4EndPoint(0));
         return ((IPEndPoint)probe.LocalEndPoint!).Port;
     }
 

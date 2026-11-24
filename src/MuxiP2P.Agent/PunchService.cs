@@ -69,7 +69,7 @@ internal sealed class PunchService
     /// 超时要盖过一次长轮询（<see cref="LongPollWait"/>）再加上正常往返。原先 10 秒，
     /// 对长轮询来说刚好会在服务端返回前被自己掐掉。
     /// </summary>
-    private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(20) };
+    private readonly HttpClient _http = Egress.NewHttpClient(TimeSpan.FromSeconds(20));
 
     /// <summary>
     /// 长轮询单次挂多久。
@@ -241,10 +241,21 @@ internal sealed class PunchService
         var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         try
         {
-            socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+            socket.Bind(Egress.V4EndPoint(0));
             var discovery = await NatDiscovery
                 .DiscoverAsync(socket, _reflectorHost, ReflectorPorts, DiscoveryRounds, ct)
                 .ConfigureAwait(false);
+            if (discovery.Candidates.Count == 0 && !((IPEndPoint)socket.LocalEndPoint!).Address.Equals(IPAddress.Any))
+            {
+                // 绑物理网卡探不到出口：这台机器只能经 VPN 出网，回退成原来的走法再探一次
+                socket.Close();
+                Egress.PhysicalUnreachable(TimeSpan.FromMinutes(5));
+                socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+                discovery = await NatDiscovery
+                    .DiscoverAsync(socket, _reflectorHost, ReflectorPorts, DiscoveryRounds, ct)
+                    .ConfigureAwait(false);
+            }
             if (discovery.Candidates.Count == 0)
             {
                 Program.Log($"探测不到本机公网出口（发出 {discovery.Sent}，回应 {discovery.Replies}），打洞暂不可用");
@@ -899,7 +910,7 @@ internal sealed class PunchService
     {
         using var probe = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         probe.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        probe.Bind(new IPEndPoint(IPAddress.Any, 0));
+        probe.Bind(Egress.V4EndPoint(0));
         return ((IPEndPoint)probe.LocalEndPoint!).Port;
     }
 

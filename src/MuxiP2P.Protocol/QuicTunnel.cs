@@ -151,9 +151,10 @@ public static class QuicTunnel
         int localPort, X509Certificate2 certificate,
         System.Net.Sockets.AddressFamily family, CancellationToken ct)
     {
+        // IPv4 绑打洞用的同一个地址（有 VPN 时是物理网卡，见 Egress），否则 QUIC 又绕回 TUN
         var any = family == System.Net.Sockets.AddressFamily.InterNetworkV6
             ? IPAddress.IPv6Any
-            : IPAddress.Any;
+            : Egress.V4;
         var options = new QuicListenerOptions
         {
             ListenEndPoint = new IPEndPoint(any, localPort),
@@ -197,7 +198,7 @@ public static class QuicTunnel
             LocalEndPoint = new IPEndPoint(
                 peer.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
                     ? IPAddress.IPv6Any
-                    : IPAddress.Any,
+                    : Egress.V4,
                 localPort),
             RemoteEndPoint = peer,
             DefaultStreamErrorCode = 0x0A,

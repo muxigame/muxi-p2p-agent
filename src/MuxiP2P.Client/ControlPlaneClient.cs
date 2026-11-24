@@ -31,11 +31,7 @@ public static class ControlPlaneClient
     ///
     /// 超时按请求给（见各处的 CancelAfter），不在客户端上设全局值。
     /// </summary>
-    internal static readonly HttpClient Http = new(new SocketsHttpHandler
-    {
-        PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
-        ConnectTimeout = TimeSpan.FromSeconds(8),
-    })
+    internal static readonly HttpClient Http = new(Egress.HttpHandler(TimeSpan.FromSeconds(8)))
     {
         Timeout = System.Threading.Timeout.InfiniteTimeSpan,
     };

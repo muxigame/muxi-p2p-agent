@@ -153,7 +153,7 @@ public static class TcpPuncher
     {
         using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        socket.Bind(new IPEndPoint(IPAddress.Any, localPort));
+        socket.Bind(Egress.V4EndPoint(localPort));
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(TimeSpan.FromSeconds(8));
         try
@@ -223,7 +223,7 @@ public static class TcpPuncher
         // 监听和拨号绑同一个端口，靠 SO_REUSEADDR。对方的 SYN 如果先到，就走这条。
         using var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         listener.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        listener.Bind(new IPEndPoint(IPAddress.Any, localPort));
+        listener.Bind(Egress.V4EndPoint(localPort));
         listener.Listen(64);
 
         // 一条连接的全部判定都在这里：互报身份 → 发起方点名 / 接受方等点名。
@@ -476,7 +476,7 @@ public static class TcpPuncher
         try
         {
             socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            socket.Bind(new IPEndPoint(IPAddress.Any, localPort));
+            socket.Bind(Egress.V4EndPoint(localPort));
             using var attempt = CancellationTokenSource.CreateLinkedTokenSource(ct);
             attempt.CancelAfter(AttemptTimeout);
             await socket.ConnectAsync(target, attempt.Token).ConfigureAwait(false);
