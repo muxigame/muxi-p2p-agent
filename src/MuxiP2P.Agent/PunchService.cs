@@ -238,24 +238,14 @@ internal sealed class PunchService
     /// <summary>新开一个 socket 并探清它的出口。探不到返回 null。</summary>
     private async Task<ReadySocket?> ProbeSocketAsync(CancellationToken ct)
     {
-        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        Socket? socket = null;
         try
         {
-            socket.Bind(Egress.V4EndPoint(0));
-            var discovery = await NatDiscovery
-                .DiscoverAsync(socket, _reflectorHost, ReflectorPorts, DiscoveryRounds, ct)
+            // 有 VPN 时先在物理网卡上探（再试一次），都不行这一次才走 VPN，见 Egress
+            var (bound, discovery) = await Egress
+                .DiscoverUdpAsync(_reflectorHost, ReflectorPorts, DiscoveryRounds, ct)
                 .ConfigureAwait(false);
-            if (discovery.Candidates.Count == 0 && !((IPEndPoint)socket.LocalEndPoint!).Address.Equals(IPAddress.Any))
-            {
-                // 绑物理网卡探不到出口：这台机器只能经 VPN 出网，回退成原来的走法再探一次
-                socket.Close();
-                Egress.PhysicalUnreachable(TimeSpan.FromMinutes(5));
-                socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-                socket.Bind(new IPEndPoint(IPAddress.Any, 0));
-                discovery = await NatDiscovery
-                    .DiscoverAsync(socket, _reflectorHost, ReflectorPorts, DiscoveryRounds, ct)
-                    .ConfigureAwait(false);
-            }
+            socket = bound;
             if (discovery.Candidates.Count == 0)
             {
                 Program.Log($"探测不到本机公网出口（发出 {discovery.Sent}，回应 {discovery.Replies}），打洞暂不可用");
@@ -269,7 +259,7 @@ internal sealed class PunchService
         catch (Exception error) when (error is not OperationCanceledException)
         {
             Program.Log($"准备打洞 socket 失败：{error.Message}");
-            socket.Close();
+            socket?.Close();
             return null;
         }
     }

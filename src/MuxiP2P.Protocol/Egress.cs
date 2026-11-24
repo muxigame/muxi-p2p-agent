@@ -80,14 +80,66 @@ public static class Egress
     /// <summary>打洞 socket 的本地端点。</summary>
     public static IPEndPoint V4EndPoint(int port) => new(V4, port);
 
+    private static int _physicalFailures;
+
+    /// <summary>连续这么多次在物理网卡上探测不到出口，才认定这台机器只能经 VPN 出网。</summary>
+    private const int FailuresBeforeFallback = 3;
+
     /// <summary>
-    /// 绑物理网卡的 socket 探测不到公网出口：这台机器只能经 VPN 出网。接下来一段时间
-    /// 回退成 <see cref="IPAddress.Any"/>（走 VPN），过后再试物理网卡。
+    /// 一次在物理网卡上的出口探测的结果。单次失败（反射器忙、包丢了）只让这一次改走 VPN；
+    /// 连续失败 <see cref="FailuresBeforeFallback"/> 次才认定这台机器只能经 VPN 出网，
+    /// 接下来 5 分钟回退成 <see cref="IPAddress.Any"/>，过后再试物理网卡。
+    /// （以前一次失败就整体回退 5 分钟：13 台同时测试时这台的反向连接全绕到了海外。）
     /// </summary>
-    public static void PhysicalUnreachable(TimeSpan forHowLong)
+    public static void NotePhysical(bool reachable)
     {
-        lock (Gate) _physicalFailedUntil = DateTime.UtcNow + forHowLong;
-        Log?.Invoke($"物理网卡上探测不到公网出口，{forHowLong.TotalMinutes:0} 分钟内打洞改走 VPN");
+        lock (Gate)
+        {
+            if (reachable)
+            {
+                _physicalFailures = 0;
+                return;
+            }
+            _physicalFailures++;
+            if (_physicalFailures < FailuresBeforeFallback) return;
+            _physicalFailures = 0;
+            _physicalFailedUntil = DateTime.UtcNow + TimeSpan.FromMinutes(5);
+        }
+        Log?.Invoke($"物理网卡上连续 {FailuresBeforeFallback} 次探测不到公网出口，5 分钟内打洞改走 VPN");
+    }
+
+    /// <summary>
+    /// 新开一个绑在 <see cref="V4"/> 上的 UDP socket 并探测它的出口。在物理网卡上探测不到时
+    /// 再试一次物理网卡，仍然不行就这一次改走 VPN（<see cref="IPAddress.Any"/>）。
+    /// </summary>
+    public static async Task<(Socket Socket, NatDiscovery.Result Discovery)> DiscoverUdpAsync(
+        string reflectorHost, int[] reflectorPorts, int rounds, CancellationToken ct)
+    {
+        var addresses = new List<IPAddress>();
+        var preferred = V4;
+        if (!preferred.Equals(IPAddress.Any)) addresses.Add(preferred);
+        if (!preferred.Equals(IPAddress.Any)) addresses.Add(preferred);
+        addresses.Add(IPAddress.Any);
+        Socket? socket = null;
+        NatDiscovery.Result discovery = new([], 0, 0, false);
+        foreach (var address in addresses)
+        {
+            socket?.Close();
+            socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            try
+            {
+                socket.Bind(new IPEndPoint(address, 0));
+                discovery = await NatDiscovery.DiscoverAsync(socket, reflectorHost, reflectorPorts, rounds, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception error) when (error is SocketException && !address.Equals(IPAddress.Any))
+            {
+                discovery = new([], 0, 0, false);
+            }
+            if (!address.Equals(IPAddress.Any)) NotePhysical(discovery.Candidates.Count > 0);
+            if (discovery.Candidates.Count > 0) break;
+        }
+        return (socket!, discovery);
     }
 
     /// <summary>日志出口（Protocol 层不依赖具体的日志实现）。</summary>

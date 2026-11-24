@@ -12,6 +12,9 @@
     <SelfContained>true</SelfContained>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <DebugType>embedded</DebugType>
+    <!-- Not CET (shadow stack) compatible: on Windows 10 before 21H1 with a CET-capable CPU (12th gen Intel
+         and later) the .NET 9 runtime asserts at start (!AreShadowStacksEnabled() || UseSpecialUserModeApc()). -->
+    <CETCompat>false</CETCompat>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../MuxiP2P.Protocol/MuxiP2P.Protocol.csproj" />

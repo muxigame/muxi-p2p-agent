@@ -126,15 +126,17 @@ public sealed class P2PTunnel : IMuxiTunnel
                 : new NatDiscovery.Result([], 0, 0, false);
             if (quicOk && discovery.Candidates.Count == 0 && !((IPEndPoint)udp.LocalEndPoint!).Address.Equals(IPAddress.Any))
             {
-                // 绑物理网卡（绕开 VPN）探不到出口：这台机器只能经 VPN 出网，回退再探一次
+                // 绑物理网卡（绕开 VPN）探不到出口：再试一次物理网卡，还不行这一次走 VPN（见 Egress）
+                Egress.NotePhysical(false);
                 udp.Close();
-                Egress.PhysicalUnreachable(TimeSpan.FromMinutes(5));
-                udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-                udp.Bind(new IPEndPoint(IPAddress.Any, 0));
-                udpPort = ((IPEndPoint)udp.LocalEndPoint!).Port;
-                discovery = await NatDiscovery
-                    .DiscoverAsync(udp, reflectorHost, ReflectorPorts, DiscoveryRounds, ct)
+                (udp, discovery) = await Egress
+                    .DiscoverUdpAsync(reflectorHost, ReflectorPorts, DiscoveryRounds, ct)
                     .ConfigureAwait(false);
+                udpPort = ((IPEndPoint)udp.LocalEndPoint!).Port;
+            }
+            else if (quicOk && !((IPEndPoint)udp.LocalEndPoint!).Address.Equals(IPAddress.Any))
+            {
+                Egress.NotePhysical(true);
             }
 
             if (discovery.Candidates.Count > 0)
