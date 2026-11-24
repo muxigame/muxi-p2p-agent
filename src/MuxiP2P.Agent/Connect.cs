@@ -34,7 +34,17 @@ internal static class Connect
             return 2;
         }
         ControlPlaneClient.SetHeaders(Headers(args));
-        Egress.Log = message => Emit(new { @event = "progress", text = message });
+        var logFile = Environment.GetEnvironmentVariable("MUXI_LOG_FILE");
+        if (!string.IsNullOrWhiteSpace(logFile))
+        {
+            Log.InitFile(logFile);
+            Log.Info($"connect {serverId}（反射器 {reflector}）");
+        }
+        Egress.Log = message =>
+        {
+            Log.Info(message);
+            Emit(new { @event = "progress", text = message });
+        };
 
         using var lifetime = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; lifetime.Cancel(); };

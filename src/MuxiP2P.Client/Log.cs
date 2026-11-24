@@ -51,6 +51,29 @@ public static class Log
         catch { }
     }
 
+    /// <summary>
+    /// 直接写到一个指定文件（覆盖），不轮转。给一次性的 <c>connect</c> 进程用：每个目标
+    /// 一个文件、只留最近一次尝试，大小有上限，几个并发的 connect 也不会抢同一个文件。
+    /// 以前 connect 根本不初始化日志，NAT 判定、诱饵、扫描这些决定全被丢掉，打洞失败
+    /// 只能看到"发出 N 个包、收到 0 个"。
+    /// </summary>
+    public static void InitFile(string path)
+    {
+        try
+        {
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+            lock (Gate)
+            {
+                _writer?.Dispose();
+                _writer = new StreamWriter(fs, new UTF8Encoding(false)) { AutoFlush = true };
+            }
+            FilePath = path;
+        }
+        catch { /* 日志本身失败不影响连接 */ }
+    }
+
     public static void Info(string msg) => Write("INFO", msg);
     public static void Warn(string msg) => Write("WARN", msg);
     public static void Error(string msg) => Write("ERROR", msg);

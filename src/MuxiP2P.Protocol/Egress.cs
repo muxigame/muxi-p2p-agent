@@ -26,6 +26,8 @@ public static class Egress
         "hyper-v", "virtual", "vmware", "virtualbox", "vethernet", "wsl", "docker",
         "tap-", "tun", "meta", "mihomo", "clash", "wintun", "zerotier", "tailscale",
         "loopback", "teredo", "isatap", "wireguard", "openvpn", "sing-box",
+        // 虚拟局域网组网软件：它们的地址只在自己的网里通，公布出去对端只会白打（实测 Radmin 26.x）
+        "radmin", "hamachi", "softether", "n2n", "easytier", "netbird", "nebula", "sakura",
         // Linux：容器和虚拟机的网桥、veth、overlay——docker 的自建网络网桥叫 br-<hash>，
         // 两台都跑 docker 的机器上 172.18.0.1 这种地址必然撞车（连到自己身上）
         "br-", "veth", "virbr", "cni", "flannel", "calico", "kube", "lxc", "lxd", "podman", "vxlan",

@@ -180,11 +180,29 @@ public static class NatDiscovery
                 if (byTarget.TryGetValue(target, out var seenAs))
                     foreach (var view in seenAs)
                         if (seen.Add(view.ToString())) found.Add(view);
-            // 只有问过两台以上、且各自都拿到了答复，这个判定才有意义。
-            var views = perReflector.Values.Where(x => x.Count > 0).ToList();
-            var addressDependent = views.Count > 1 && !views.All(x => x.SetEquals(views[0]));
-            return new Result(found, replies, sent, addressDependent);
+            return new Result(found, replies, sent, IsAddressDependent(byTarget.Values, perReflector.Values));
         }
+    }
+
+    /// <summary>
+    /// 同一个 socket 换个目标就换映射 = 地址（端口）相关型。
+    ///
+    /// 以前只比"两台反射器各自看到的映射"。但反射器绑 0.0.0.0 时回包的源地址是主 IP，
+    /// 地址相关过滤的 NAT（移动网络基本都是）会把第二台的回包丢掉——只剩一台可比，
+    /// 对称型被误判成端点无关：不开诱饵、还让对端照准确地址打，于是主动发起必败
+    /// （实测手机热点：同一个 socket 问同一台反射器的 3 个端口，拿到 34929/35017/35018）。
+    /// 现在逐个目标（反射器 IP × 端口）比：任意两个目标看到的映射不同就算。
+    /// </summary>
+    internal static bool IsAddressDependent(
+        IEnumerable<IEnumerable<IPEndPoint>> perTarget, IEnumerable<HashSet<string>> perReflector)
+    {
+        var targets = perTarget
+            .Select(views => views.Select(x => x.ToString()).ToHashSet(StringComparer.Ordinal))
+            .Where(x => x.Count > 0)
+            .ToList();
+        if (targets.Count > 1 && !targets.All(x => x.SetEquals(targets[0]))) return true;
+        var reflectors = perReflector.Where(x => x.Count > 0).ToList();
+        return reflectors.Count > 1 && !reflectors.All(x => x.SetEquals(reflectors[0]));
     }
 
     /// <summary>把 socket 里已经到了的包读掉扔掉，不等。</summary>
