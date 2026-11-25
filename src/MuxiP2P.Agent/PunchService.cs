@@ -107,6 +107,10 @@ internal sealed class PunchService
     /// <summary>本机地址能否被对端提前知道——决定要不要由我们来扫端口。</summary>
     private volatile bool _findable;
     private DateTimeOffset _refreshed = DateTimeOffset.MinValue;
+    /// <summary>公布的那个 socket 的 NAT 画像，随候选一起上报（见 <see cref="NatProfile"/>）。</summary>
+    private volatile NatProfile? _profile;
+    /// <summary>观测通道和过滤测试用的反射器端点（解析一次）。</summary>
+    private IPEndPoint? _reflector;
 
     public PunchService(string baseUrl, string serverId, string token, string reflectorHost,
         string targetHost, int targetPort)
@@ -131,7 +135,9 @@ internal sealed class PunchService
         [.. _candidates,
          .. _spareCandidates.Select(x => P2PTags.UdpAlternate + x),
          .. (TcpPunchEnabled ? _tcpCandidates : [])
-             .Select(x => P2PTags.TcpTagFor(_tcpAddressDependent) + x)];
+             .Select(x => P2PTags.TcpTagFor(_tcpAddressDependent) + x),
+         // 画像放最后：控制面最多收 16 条（6 主 + 6 备 + 1 画像），老客户端会自然跳过它。
+         .. (_candidates.Length > 0 && _profile is { } profile ? new[] { profile.ToTag() } : Array.Empty<string>())];
 
     /// <summary>
     /// 备用 socket 的出口，随主候选一起上报（带 <see cref="P2PTags.UdpAlternate"/> 前缀）。
@@ -227,7 +233,7 @@ internal sealed class PunchService
 
     /// <summary>一个已经探过出口、可以直接拿去打洞的 socket。</summary>
     internal readonly record struct ReadySocket(
-        Socket Socket, string[] Candidates, bool Findable, DateTimeOffset ProbedAt);
+        Socket Socket, string[] Candidates, bool Findable, DateTimeOffset ProbedAt, NatProfile Profile);
 
     /// <summary>
     /// 备用的就绪 socket。取走当前 socket 时它立刻顶上，见 <see cref="TakeSocket"/>。
@@ -252,15 +258,36 @@ internal sealed class PunchService
                 socket.Close();
                 return null;
             }
+            var filtering = await FilteringAsync(socket, ct).ConfigureAwait(false);
             return new ReadySocket(socket,
                 discovery.Candidates.Select(x => x.ToString()).ToArray(),
-                !discovery.AddressDependent, DateTimeOffset.UtcNow);
+                !discovery.AddressDependent, DateTimeOffset.UtcNow,
+                NatClassifier.Classify(discovery, filtering));
         }
         catch (Exception error) when (error is not OperationCanceledException)
         {
             Program.Log($"准备打洞 socket 失败：{error.Message}");
             socket?.Close();
             return null;
+        }
+    }
+
+    /// <summary>
+    /// 过滤方式（NAT1/2/3）。FilteringProbe 自己按本地地址缓存 10 分钟，每次备 socket 时调它
+    /// 不会真的每次都测。测不出来不影响打洞，只是策略按"不知道"走。
+    /// </summary>
+    private async Task<FilteringProbe.Result> FilteringAsync(Socket socket, CancellationToken ct)
+    {
+        try
+        {
+            _reflector ??= await NatProbe.ReflectorAsync(_reflectorHost, ReflectorPorts[0], ct).ConfigureAwait(false);
+            return await NatProbe.FilteringAsync(((IPEndPoint)socket.LocalEndPoint!).Address, _reflector, ct)
+                .ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is not OperationCanceledException)
+        {
+            Program.Log($"过滤方式测试失败（不影响打洞）：{error.Message}");
+            return FilteringProbe.Result.Unknown;
         }
     }
 
@@ -315,11 +342,10 @@ internal sealed class PunchService
         _socket = ready.Socket;
         _candidates = ready.Candidates;
         _findable = ready.Findable;
+        _profile = ready.Profile;
         // 记它**探测**的时刻，不是公布的时刻，见 RefreshInterval。
         _refreshed = ready.ProbedAt;
-        Program.Log("本机 NAT 类型：" + (!ready.Findable
-            ? "地址相关型 NAT（换个目标就换映射端口）——对端需要在邻近端口扫描才能命中"
-            : "端点无关型 NAT（对所有目标同一个映射）——对端照着这个地址直接打就行"));
+        Program.Log("本机 NAT 类型：" + ready.Profile.Describe());
         Program.Log($"打洞就绪，本机出口候选 {_candidates.Length} 个：{string.Join("，", _candidates)}");
         CandidatesChanged?.Invoke();
     }
@@ -340,7 +366,7 @@ internal sealed class PunchService
     private ReadySocket? TakeSocket()
     {
         if (_socket is not { } socket) return null;
-        var taken = new ReadySocket(socket, _candidates, _findable, _refreshed);
+        var taken = new ReadySocket(socket, _candidates, _findable, _refreshed, _profile ?? NatProfile.Unknown);
         _socket = null;
         _candidates = [];
         if (_spare is { } spare)
@@ -429,6 +455,9 @@ internal sealed class PunchService
             var changed = !fresh.SequenceEqual(_candidates);
             if (changed) Program.Log($"出口候选已变化：{string.Join("，", fresh)}");
             _candidates = fresh;
+            // 对称型的计数器在往上走，画像里的计数器位置跟着候选一起刷新。
+            _profile = NatClassifier.Classify(discovery,
+                await FilteringAsync(socket, ct).ConfigureAwait(false));
             if (changed) CandidatesChanged?.Invoke();
         }
         catch (Exception error) when (error is not OperationCanceledException)
@@ -450,6 +479,8 @@ internal sealed class PunchService
                 {
                     Candidates = discovery.Candidates.Select(x => x.ToString()).ToArray(),
                     ProbedAt = DateTimeOffset.UtcNow,
+                    Profile = NatClassifier.Classify(discovery,
+                        await FilteringAsync(spare.Socket, ct).ConfigureAwait(false)),
                 });
             else
                 throw new InvalidOperationException("反射器没有回应");
@@ -464,7 +495,8 @@ internal sealed class PunchService
 
     private readonly record struct PunchRequest(
         ulong Session, IReadOnlyList<IPEndPoint> Candidates, DateTimeOffset PunchAt,
-        IReadOnlyList<IPEndPoint> TcpCandidates, bool PeerTcpEndpointIndependent);
+        IReadOnlyList<IPEndPoint> TcpCandidates, bool PeerTcpEndpointIndependent,
+        NatProfile? PeerProfile = null);
 
     private async Task<List<PunchRequest>> PollAsync(CancellationToken ct)
     {
@@ -507,10 +539,16 @@ internal sealed class PunchService
             // 对端只要有一条带端点无关前缀就按端点无关算：同侧候选类型必然一致，
             // 混进来的老前缀条目只说明对端版本旧。
             var peerTcpEim = false;
+            NatProfile? peerProfile = null;
             if (item.TryGetProperty("candidates", out var candidates))
                 foreach (var candidate in candidates.EnumerateArray())
                 {
                     var text = candidate.GetString() ?? "";
+                    if (NatProfile.TryParseTag(text, out var tagged))
+                    {
+                        peerProfile = tagged;
+                        continue;
+                    }
                     var isTcp = P2PTags.TryStripTcp(text, out text, out var eim);
                     if (IPEndPoint.TryParse(text, out var endpoint))
                     {
@@ -530,7 +568,7 @@ internal sealed class PunchService
                     ? DateTimeOffset.FromUnixTimeMilliseconds((long)(seconds * 1000))
                     : DateTimeOffset.UtcNow;
             if (peers.Count > 0 || tcpPeers.Count > 0)
-                result.Add(new PunchRequest(session, peers, at, tcpPeers, peerTcpEim));
+                result.Add(new PunchRequest(session, peers, at, tcpPeers, peerTcpEim, peerProfile));
         }
         return result;
     }
@@ -570,6 +608,7 @@ internal sealed class PunchService
                     + $"对端 UDP [{string.Join("，", request.Candidates)}]，"
                     + $"对端 TCP {request.TcpCandidates.Count} 个；"
                     + $"本机这一刻 UDP [{string.Join("，", ready.Candidates)}]"
+                    + (request.PeerProfile is { } peerNat ? $"，对端 NAT：{peerNat.Describe()}" : "，对端没报 NAT 画像")
                     + $"（{(DateTimeOffset.UtcNow - ready.ProbedAt).TotalSeconds:0} 秒前探的）");
         // 和隧道握手同源：客户端手里是控制面派生的 token，不是 master。
         //
@@ -612,7 +651,8 @@ internal sealed class PunchService
                 request.PunchAt, TimeSpan.FromSeconds(10),
                 sweepPorts: ready.Findable,
                 message => Program.Log("UDP 打洞：" + message), ct,
-                awaitPeerChoice: true).ConfigureAwait(false)
+                awaitPeerChoice: true,
+                plan: new PunchPlan(ready.Profile, request.PeerProfile, 'a', _reflector)).ConfigureAwait(false)
             : new UdpPuncher.Outcome(null, TimeSpan.Zero, 0, 0, []);
 
         // 客户端在建 QUIC 之前会先用裸 UDP 压一下这个洞（见 HoleLoadTest），我们是

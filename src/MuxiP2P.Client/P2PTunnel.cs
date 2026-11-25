@@ -114,6 +114,13 @@ public sealed class P2PTunnel : IMuxiTunnel
             var udpPort = ((IPEndPoint)udp.LocalEndPoint!).Port;
 
             progress?.Report("正在探测本机公网出口");
+            // 过滤方式（NAT1/2/3）用另一个新 socket 测，和出口探测并行，不叠时延。
+            var reflector = quicOk
+                ? await NatProbe.ReflectorAsync(reflectorHost, ReflectorPorts[0], ct).ConfigureAwait(false)
+                : null;
+            var filteringProbe = quicOk
+                ? NatProbe.FilteringAsync(((IPEndPoint)udp.LocalEndPoint!).Address, reflector, ct)
+                : Task.FromResult(FilteringProbe.Result.Unknown);
             // UDP 和 TCP 的出口探测互不相干（两套映射、两个 socket），一起探。
             // 原先是先 UDP 后 TCP 串着来，TCP 那 0.4~1.4 秒白白叠在建立时延上。
             var tcpProbe = tcpEnabled
@@ -139,11 +146,14 @@ public sealed class P2PTunnel : IMuxiTunnel
                 Egress.NotePhysical(true);
             }
 
+            FilteringProbe.Result filtering;
+            try { filtering = await filteringProbe.ConfigureAwait(false); }
+            catch (Exception error) when (!Cancellation.IsShutdown(error, ct)) { filtering = FilteringProbe.Result.Unknown; }
+            var profile = NatClassifier.Classify(discovery, filtering);
             if (discovery.Candidates.Count > 0)
             {
-                Log.Info("本机 NAT 类型（UDP）：" + (discovery.AddressDependent
-                    ? "地址相关型——对端需要在邻近端口扫描才能命中"
-                    : "端点无关型——对端照着这个地址直接打就行"));
+                Log.Info("本机 NAT 类型（UDP）：" + profile.Describe()
+                         + (filtering.ReflectorV2 ? "" : "（反射器不支持过滤测试/观测通道）"));
                 Log.Info($"本机 UDP 出口候选 {discovery.Candidates.Count} 个：" +
                          string.Join("，", discovery.Candidates));
             }
@@ -167,7 +177,9 @@ public sealed class P2PTunnel : IMuxiTunnel
             progress?.Report($"与服务器交换连接信息（UDP {discovery.Candidates.Count} / TCP {tcpMine.Count}）");
             var rendezvous = await ExchangeAsync(
                 controlPlaneBaseUrl, serverId, discovery.Candidates, tcpMine,
-                tcpDependent, ct).ConfigureAwait(false);
+                tcpDependent, ct, discovery.Candidates.Count > 0 ? profile.ToTag() : null).ConfigureAwait(false);
+            if (rendezvous.PeerProfile is { } peerProfile)
+                Log.Info("对端 NAT 类型：" + peerProfile.Describe());
             timing.Mark("交换信令");
             if (rendezvous.PeerCandidates.Count == 0
                 && (!tcpEnabled || rendezvous.PeerTcpCandidates.Count == 0))
@@ -180,7 +192,8 @@ public sealed class P2PTunnel : IMuxiTunnel
             var races = new List<Task<IMuxiTunnel?>>();
             if (quicOk && rendezvous.PeerCandidates.Count > 0 && !UdpPunchDisabled)
                 races.Add(ViaUdpAsync(
-                    udp, udpPort, rendezvous, secret, discovery.AddressDependent, timing, ct));
+                    udp, udpPort, rendezvous, secret, discovery.AddressDependent, timing, ct,
+                    new PunchPlan(profile, rendezvous.PeerProfile, 'c', reflector)));
             if (tcpEnabled && rendezvous.PeerTcpCandidates.Count > 0)
                 races.Add(ViaTcpAsync(
                     tcpDependent,
@@ -270,7 +283,7 @@ public sealed class P2PTunnel : IMuxiTunnel
 
     private static async Task<IMuxiTunnel?> ViaUdpAsync(
         Socket udp, int localPort, Rendezvous rendezvous, byte[] secret,
-        bool addressDependent, PhaseTimer timing, CancellationToken ct)
+        bool addressDependent, PhaseTimer timing, CancellationToken ct, PunchPlan? plan = null)
     {
         // 不再干等约定时刻：拿到会合信息就开打，理由见 UdpPuncher.PunchAsync 开头。
         // 于是"UDP打洞"这一格现在包含了等 agent 取件的时间——它原先藏在固定 4 秒的
@@ -280,7 +293,7 @@ public sealed class P2PTunnel : IMuxiTunnel
             rendezvous.PunchAt, TimeSpan.FromSeconds(10),
             sweepPorts: !addressDependent,
             message => Log.Info("UDP 打洞：" + message), ct,
-            alternates: rendezvous.PeerAlternates).ConfigureAwait(false);
+            alternates: rendezvous.PeerAlternates, plan: plan).ConfigureAwait(false);
         timing.Mark("UDP打洞");
         if (!outcome.Success)
             throw new InvalidOperationException(
@@ -360,7 +373,22 @@ public sealed class P2PTunnel : IMuxiTunnel
         // 拖到 3477ms。
         try { await Task.Delay(QuicHandoffGap, ct).ConfigureAwait(false); }
         catch (OperationCanceledException) { throw; }
-        var connection = await QuicTunnel.ConnectAsync(livePort, peer, ct).ConfigureAwait(false);
+        System.Net.Quic.QuicConnection connection;
+        try
+        {
+            connection = await QuicTunnel.ConnectAsync(livePort, peer, ct).ConfigureAwait(false);
+        }
+        // 只在"对端不可达"时重试一次，正常路径不受影响（上面说的"短超时+重试"是另一回事）。
+        //
+        // 实测机器 B 当应答方时 6 次里 2 次洞已经打通、QUIC 却立刻报"套接字操作尝试一个无法连接
+        // 的主机"：我们的第一个 Initial 落进了对端"关裸 socket → 在同一端口起 QUIC 监听"的缝里，
+        // 对端系统回了 ICMP 不可达，msquic 收到就整条放弃。洞本身还开着，等监听起来再连就行。
+        catch (Exception error) when (!ct.IsCancellationRequested && IsUnreachable(error))
+        {
+            Log.Warn($"QUIC 首次握手收到不可达（{error.Message}），洞还开着，{QuicRetryAfter.TotalMilliseconds:0}ms 后再连一次");
+            await Task.Delay(QuicRetryAfter, ct).ConfigureAwait(false);
+            connection = await QuicTunnel.ConnectAsync(livePort, peer, ct).ConfigureAwait(false);
+        }
         timing.Mark("QUIC握手");
         Log.Info($"P2P(UDP/QUIC) 隧道已建立 {peer}，本地端口 {livePort}，{DescribeMtu(connection)}");
         return new P2PTunnel(connection, peer);
@@ -385,6 +413,27 @@ public sealed class P2PTunnel : IMuxiTunnel
     /// 要付的一个 PTO（约 1 秒）。往大调没有额外收益，往小调会重新开始丢 Initial。
     /// </summary>
     private static readonly TimeSpan QuicHandoffGap = TimeSpan.FromMilliseconds(60);
+
+    /// <summary>QUIC 首次握手撞上对端交接缝（ICMP 不可达）之后，等多久再连。</summary>
+    private static readonly TimeSpan QuicRetryAfter = TimeSpan.FromMilliseconds(400);
+
+    private static bool IsUnreachable(Exception error)
+    {
+        for (var e = error; e is not null; e = e.InnerException)
+        {
+            if (e is SocketException { SocketErrorCode: SocketError.HostUnreachable or SocketError.NetworkUnreachable
+                    or SocketError.ConnectionRefused or SocketError.ConnectionReset })
+                return true;
+            if (e is System.Net.Quic.QuicException { QuicError: System.Net.Quic.QuicError.ConnectionRefused })
+                return true;
+            // msquic 有时把系统错误包成一句话（WSAEHOSTUNREACH = 10065）。
+            if (e.HResult == 10065
+                || e.Message.Contains("unreachable", StringComparison.OrdinalIgnoreCase)
+                || e.Message.Contains("无法连接的主机", StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
 
     /// <summary>
     /// 临时开关：设了环境变量 MUXI_NO_TCP_PUNCH=1 就不做 TCP 打洞。
@@ -564,7 +613,7 @@ public sealed class P2PTunnel : IMuxiTunnel
     internal readonly record struct Rendezvous(
         ulong Session, IReadOnlyList<IPEndPoint> PeerCandidates, DateTimeOffset PunchAt,
         IReadOnlyList<IPEndPoint> PeerTcpCandidates, bool PeerTcpEndpointIndependent,
-        IReadOnlyList<IPEndPoint> PeerAlternates);
+        IReadOnlyList<IPEndPoint> PeerAlternates, NatProfile? PeerProfile = null);
 
     /// <summary>
     /// TCP 候选在同一个候选列表里传，加 "t:" 前缀区分。
@@ -580,7 +629,8 @@ public sealed class P2PTunnel : IMuxiTunnel
 
     internal static async Task<Rendezvous> ExchangeAsync(
         string baseUrl, string serverId, IReadOnlyList<IPEndPoint> mine,
-        IReadOnlyList<IPEndPoint> mineTcp, bool myTcpAddressDependent, CancellationToken ct)
+        IReadOnlyList<IPEndPoint> mineTcp, bool myTcpAddressDependent, CancellationToken ct,
+        string? natTag = null)
     {
         var session = (ulong)Random.Shared.NextInt64();
         // 复用控制面那条热连接，省掉一次 TLS 握手，见 ControlPlaneClient.Http。
@@ -595,6 +645,8 @@ public sealed class P2PTunnel : IMuxiTunnel
         var tcpTag = P2PTags.TcpTagFor(myTcpAddressDependent);
         var all = mine.Select(x => x.ToString())
             .Concat(mineTcp.Select(x => tcpTag + x)).ToList();
+        // NAT 画像条目放最后：控制面最多收 16 条，老 agent 解析不了会自然跳过。
+        if (natTag is not null) all.Add(natTag);
         for (var i = 0; i < all.Count; i++)
         {
             if (i > 0) body.Append(',');
@@ -615,9 +667,15 @@ public sealed class P2PTunnel : IMuxiTunnel
         // 对端只要有一条 TCP 候选带的是端点无关的前缀，就按端点无关算：同一侧的
         // 候选类型必然一致，而混进来的老前缀条目只说明对端版本旧，不说明它对称。
         var peerTcpEim = false;
+        NatProfile? peerProfile = null;
         if (root.TryGetProperty("peerCandidates", out var list) && list.ValueKind == JsonValueKind.Array)
             foreach (var item in list.EnumerateArray())
             {
+                if (NatProfile.TryParseTag(item.GetString() ?? "", out var tagged))
+                {
+                    peerProfile = tagged;
+                    continue;
+                }
                 if (P2PTags.TryStripAlternate(item.GetString() ?? "", out var alternate))
                 {
                     if (IPEndPoint.TryParse(alternate, out var spare)) alternates.Add(spare);
@@ -640,7 +698,7 @@ public sealed class P2PTunnel : IMuxiTunnel
             : root.TryGetProperty("punchAt", out var at) && at.TryGetDouble(out var seconds)
                 ? DateTimeOffset.FromUnixTimeMilliseconds((long)(seconds * 1000))
                 : DateTimeOffset.UtcNow.AddSeconds(1);
-        return new Rendezvous(session, peers, punchAt, peersTcp, peerTcpEim, alternates);
+        return new Rendezvous(session, peers, punchAt, peersTcp, peerTcpEim, alternates, peerProfile);
     }
 
     /// <summary>

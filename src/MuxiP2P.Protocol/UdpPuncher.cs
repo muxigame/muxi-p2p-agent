@@ -14,6 +14,10 @@ namespace BatterMC.Protocol;
 /// 成功判据是收到 <see cref="PunchProtocol.Kind.Ack"/>：那说明"我发出去的包到了
 /// 对面"且"对面的回包也到了我这里"，双向都通。只收到对方的 Punch 不算——那只
 /// 证明单向。
+///
+/// 这里只是引擎：收包、回 Ack、判成功、收尾。**往哪儿发**按两侧 NAT 类型的组合分到
+/// Punching/ 下的各个策略里（锥形对锥形、锥形对对称、对称对锥形、对称对对称的两种），
+/// 由 <see cref="PunchPlanner"/> 挑。
 /// </summary>
 public static class UdpPuncher
 {
@@ -44,111 +48,6 @@ public static class UdpPuncher
     /// 一次。固定等 2 秒相比之下并没有多给任何保障——只是等了 40 个间隔而不是 3 个。
     /// </summary>
     private static readonly TimeSpan AckRedundancy = TimeSpan.FromMilliseconds(150);
-
-    /// <summary>
-    /// 端口扫描的窗口与节奏。
-    ///
-    /// 为什么需要：对端如果是地址相关型（对称型）NAT，它报给我们的映射是它探反射器
-    /// 时建的，朝我们发包时用的是**另一个端口**，我们照着报上来的那个打必然打偏。
-    /// 但运营商 NAT 的端口是顺序分配的（实测每秒消耗约一百个），真实端口就在报上来
-    /// 那个附近。往上扫一段就能命中。
-    ///
-    /// 命中之后双向同时通：对方为了打洞已经朝我们发过包，它的 NAT 早就为我们这个
-    /// 源地址开好了口子——缺的只是我们不知道该发到它的哪个端口。
-    ///
-    /// 只在准确地址打不通时才展开：锥形 NAT 常常一个包就成了，没必要为少数情况
-    /// 让所有人都多发几千个包，也避免把正常打洞弄得像端口扫描。
-    /// </summary>
-    /// <summary>
-    /// 扫描是**单边**的：谁的地址能被对方提前知道，谁就负责去找对方。
-    ///
-    /// 我方端点无关时，我的地址稳定且已经通过信令报给了对方，对方照着打就行——
-    /// 找不到的那一侧是对方，所以由我来扫。反过来我方地址相关时，我的地址对方
-    /// 根本预测不了，我再去扫对方那个**已知且稳定**的地址毫无意义：那里没有东西
-    /// 需要找。更糟的是，如果我这侧是「地址+端口相关」型，朝对方几百个不同端口
-    /// 发包会各自产生一个新映射，一口气烧掉几百个运营商端口，把我自己的真实映射
-    /// 推得更远，反而让对方更难找到我。
-    /// </summary>
-    private static readonly TimeSpan SweepAfter = TimeSpan.FromSeconds(1.5);
-
-    /// <summary>
-    /// 窗口宽度按实测的 NAT 开门时间定。
-    ///
-    /// 实测：朝某个地址发一个包之后，静默 20 秒对方仍然打得进来，45 秒就不行了
-    /// ——两层 NAT 串联，取更短的那个，约 30 秒（Linux nf_conntrack_udp_timeout
-    /// 的默认值）。也就是说扫描期间开出的每一扇门，在整个打洞预算内都一直开着，
-    /// 不需要反复去敲。
-    ///
-    /// 所以正确的做法不是把包挤在几秒内猛打，而是在预算内低速铺开、把网撒宽：
-    /// 2496 个端口 / 24 个每轮 / 50ms 一轮 ≈ 1.6 遍覆盖，峰值约 480 包每秒、
-    /// 25 KB/s，conntrack 峰值 2496 条——对企业级路由器可以忽略，也远低于运营商
-    /// 每用户会话上限（常见 1000~8000 的量级要看，所以没有再往上加）。
-    ///
-    /// 为什么不干脆扫满 65535：那是"端口随机分配且毫无窗口信息"时才该用的手段。
-    /// 实测运营商 NAT 是顺序分配、报上来的号就是窗口起点，撒满全域只多花 26 倍
-    /// 代价换同样的命中率，还会撞上运营商的会话上限（波及整个家庭网络）、并且
-    /// 在对端看来就是标准的端口扫描——真被拉黑，我们的服务器 IP 会被那个玩家的
-    /// 网络长期拒绝，比打洞失败严重得多。
-    /// </summary>
-    private const int SweepBelow = 64;
-    private const int SweepAbove = 2432;
-
-    /// <summary>
-    /// 每轮扫几个。这个数乘以 1/SendInterval 就是发包速率，而速率才是真正的约束。
-    ///
-    /// 原来是 24，配上 50ms 一轮就是 **480 包/秒**——按每包 60 字节约 29 KB/s。
-    /// 问题有两个，实测都撞上了：
-    ///   · 玩家那条线路对 UDP 限速到 3 KB/s（正是当初要做 TCP 隧道的原因），
-    ///     480 pps 远在预算之上，连同直连地址那几个包一起被丢掉，双方各发三千
-    ///     多个包、互相收到 0。
-    ///   · 在对端的运营商 NAT 看来，这就是标准端口扫描。
-    ///
-    /// 降到 4（80 包/秒，约 5 KB/s）。覆盖面确实小了，但覆盖面只在"对端映射不可
-    /// 预测"时才值钱；两边都是端点无关映射时，准确地址那一个包就够了，扫描纯属
-    /// 陪跑。真正的解法是把 NAT 类型也传给对端、可预测时根本不扫——那要改线上
-    /// 的候选格式，得等客户端都更新完再做。
-    /// </summary>
-    private const int SweepPerRound = 4;
-
-    /// <summary>
-    /// 本机映射不可预测时，额外开几个 socket 一起朝对端已知端点发（生日攻击）。
-    ///
-    /// 这是对称型 NAT 能不能稳定打通的关键。对称型那一侧的外部端口连它自己都不知道
-    /// （朝反射器和朝对端拿到的是两个不同的端口），所以只能由对端扫描去撞。撞的概率
-    /// 是「对端扫了 M 个端口 / 端口空间里在用的 K 个」——单个 socket 就一发。
-    ///
-    /// 多开 N 个 socket 各发一遍，就变成 1−(1−M/K)^N：只要**任意**一对撞上就通。
-    /// 实测蜂窝（中国移动，UDP 地址相关型）单 socket 6 次 3 成，也就是 M/K≈50%；
-    /// N=16 时理论上 1−0.5^16，远超"够用"。
-    ///
-    /// 为什么这不是"端口扫描"：这些 socket 都只朝对端**那一个**已知端点发，源端口
-    /// 多、目标端口唯一。真正会被运营商认成扫描的是反过来——一个源打几千个目标端口，
-    /// 那是 SweepPerRound 那一侧的事，代价在那里已经压过了。
-    ///
-    /// 16 个 socket × 1 个目标 / 50ms ≈ 320 包/秒、约 19 KB/s。今天实测过这条链路
-    /// 扛 2 MB/s 定速 UDP 零丢包，这个量级不构成风险。
-    /// </summary>
-    private const int DecoySockets = 16;
-
-    /// <summary>
-    /// 两侧都是地址相关型（对称型）时，每轮新建几条"流"（换一个新目标端口发一次）。
-    ///
-    /// 这时诱饵和单侧扫描都没用：一侧的扫描要撞上对端**朝我们**新开的那个映射，而对端
-    /// 朝哪儿发、开出哪个端口，又取决于它在猜我们。办法是利用两边 NAT 都**顺序分配**
-    /// 端口（实测手机热点 +1/+2、移动宽带 46063→46069）：
-    ///
-    ///   我方第 i 条新流的映射 ≈ 我方已报端口 + i（+ 漂移 dA）
-    ///   我方第 i 条新流的目标 = 对方已报端口 + i + r（r 随机 0..DriftSpread）
-    ///
-    /// 对方做同样的事。只要某一对 (i, j) 恰好互相指向——我方 pa+i 朝 pb+j、对方 pb+j 朝
-    /// pa+i——两边 NAT 都已放行，后到的那个包就进得来（不需要同时发）。随机 r 用来吸收
-    /// 两边各自被别的程序占掉的端口（漂移）：期望命中数约为 流数 ÷ (DriftSpread+1)。
-    /// 每轮 3 条、50ms 一轮，10 秒约 600 条流：每秒 60 个新映射，远低于运营商的会话上限。
-    /// </summary>
-    private const int SymmetricFlowsPerRound = 3;
-    private const int DriftSpread = 24;
-    /// <summary>每轮再给已建的流补发几个（丢包时还有机会），不新开映射。</summary>
-    private const int SymmetricResendPerRound = 6;
 
     /// <param name="PeerLoadRequest">
     /// 打洞期间对端已经发来的洞压测请求（nonce 里编着计划）。对端只有在它自己判定
@@ -189,7 +88,8 @@ public static class UdpPuncher
         Action<string>? log,
         CancellationToken ct,
         IReadOnlyList<IPEndPoint>? alternates = null,
-        bool awaitPeerChoice = false)
+        bool awaitPeerChoice = false,
+        PunchPlan? plan = null)
     {
         if (peerCandidates.Count == 0)
             return new Outcome(null, TimeSpan.Zero, 0, 0, [], null);
@@ -211,43 +111,16 @@ public static class UdpPuncher
         }
         SilenceIcmpResets(socket);
 
-        // 本机映射不可预测时，多开几个 socket 一起朝对端已知端点发，好让对端的扫描
-        // 有 N 倍的机会撞上其中一个（生日攻击，见 DecoySockets）。
-        //
-        // 只在 !sweepPorts 时开——那个标志的含义正是"我方地址对端预测不了"，也就是
-        // 需要被找到的那一侧。反过来两侧都端点无关时，准确地址一发就中，多开纯浪费。
-        // 对端是不是对称型：同一个地址报了多个不同端口，就说明它每个目标拿到的映射
-        // 都不一样——那正是地址相关型的定义。
-        //
-        // 这个判据不需要改候选格式，也不需要对端升级：候选列表里本来就带着答案。
-        // （实测：蜂窝端报 6 个端口 198.51.100.47:6362~6427，家宽端报 1 个。）
-        var peerLikelySymmetric = peerCandidates
-            .GroupBy(x => x.Address)
-            .Any(g => g.Select(x => x.Port).Distinct().Count() > 1);
-        // 两侧都是对称型：走双向顺序预测（见 SymmetricFlowsPerRound），不开诱饵——诱饵一开头
-        // 就要各吃掉几十个端口，把两边的序号全打乱。
-        var bothSymmetric = !sweepPorts && peerLikelySymmetric;
-        var pools = bothSymmetric ? PortPools(peerCandidates) : [];
-
-        var decoys = new List<Socket>();
-        if (!sweepPorts && !bothSymmetric)
-        {
-            for (var i = 0; i < DecoySockets; i++)
-            {
-                try
-                {
-                    var extra = new Socket(
-                        AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-                    extra.Bind(Egress.V4EndPoint(0));
-                    SilenceIcmpResets(extra);
-                    decoys.Add(extra);
-                }
-                catch (SocketException) { break; }
-            }
-            if (decoys.Count > 0)
-                log?.Invoke($"本机映射对端预测不了，额外开 {decoys.Count} 个端口一起打"
-                            + "（靠数量换命中率，不是端口扫描）");
-        }
+        // 两侧的 NAT 画像。老调用方不给 plan：本机类型按 sweepPorts（"我的地址能被对方提前
+        // 知道" = 端点无关），对端按候选推断——落到的策略和改版前的行为一致。
+        var myNat = plan?.Mine is { Mapping: not NatMapping.Unknown } given
+            ? given
+            : sweepPorts
+                ? new NatProfile(NatMapping.EndpointIndependent, NatFiltering.Unknown, NatAllocation.Stable, [], false)
+                : new NatProfile(NatMapping.AddressDependent, NatFiltering.Unknown, NatAllocation.Unknown, [], false);
+        var peerNat = plan?.Peer ?? NatProfile.Infer(peerCandidates);
+        plan ??= new PunchPlan(myNat, null, 'c', null);
+        await using var strategy = PunchPlanner.Choose(myNat, peerNat, plan);
 
         // 自己发出去的 nonce。收到 Ack 时用它确认"这是对我那一发的回应"，
         // 而不是别人重放的旧包。
@@ -357,11 +230,7 @@ public static class UdpPuncher
         }
 
         var receivers = new List<Task> { Task.Run(() => ReceiveLoopAsync(socket), stop.Token) };
-        foreach (var decoy in decoys)
-        {
-            var mine = decoy;
-            receivers.Add(Task.Run(() => ReceiveLoopAsync(mine), stop.Token));
-        }
+        var extras = new List<Socket>();
 
         // 拿到会合信息就开打，不再干等约定时刻。
         //
@@ -379,80 +248,42 @@ public static class UdpPuncher
 
         // 把对端地址写出来，不只写个数。打洞失败时最要紧的问题是"我打的这个地址
         // 到底对不对"——两边日志各有一半，只有都印出地址才能对出是谁的候选陈旧了。
-        // 实测有过双方各发三千多个包、互相收到 0 的情况，没有地址就只能靠猜。
         log?.Invoke($"开始打洞：对端 [{string.Join("，", peerCandidates)}]"
                     + (exact.Count > peerCandidates.Count
                         ? $"，备用 [{string.Join("，", exact.Skip(peerCandidates.Count))}]" : "")
                     + $"，预算 {budget.TotalSeconds:0.#}s"
-                    + (delay > TimeSpan.Zero ? $"（比约定时刻早 {delay.TotalMilliseconds:0} ms 开打）" : "")
-                    + (sweepPorts ? "，准确地址打不通会展开端口扫描" : "，本机地址对方预测不了，不扫描"));
-        var sweepCursor = 0;
+                    + (delay > TimeSpan.Zero ? $"（比约定时刻早 {delay.TotalMilliseconds:0} ms 开打）" : ""));
+        log?.Invoke($"本机 {myNat.Describe()}；对端 {peerNat.Describe()}"
+                    + (plan.Peer is null ? "（对端没报画像，按候选推断）" : ""));
 
-        // 判成对称型就立刻开扫，不再白等那 1.5 秒。判错的代价很小：多扫一会儿而已，
-        // 准确地址那一发每轮照发。
-        if (bothSymmetric)
-            log?.Invoke($"两侧都是对称型：双向顺序预测，每轮新开 {SymmetricFlowsPerRound} 条流、"
-                        + $"偏移 0~{DriftSpread}，对端端口池 [{string.Join("，", pools.Select(p => $"{p.Address}:{p.Port}+"))}]");
-        var symmetricTargets = new List<IPEndPoint>();
-        var symmetricIndex = 0;
-        var sweepAfter = peerLikelySymmetric ? TimeSpan.Zero : SweepAfter;
-        if (sweepPorts && peerLikelySymmetric)
-            log?.Invoke("对端同一地址报了多个端口，判定为对称型——立刻开扫，不等准确地址");
+        var context = new PunchContext
+        {
+            Main = socket,
+            Candidates = peerCandidates,
+            Exact = exact,
+            Session = session,
+            Started = started,
+            Epoch = delay > TimeSpan.Zero ? punchAt : started,
+            Mine = myNat,
+            Peer = peerNat,
+            Plan = plan,
+            Log = log,
+            SendAsync = async (via, target, token) =>
+                sent += await SendPunchAsync(via, target, session, secret, outstanding, token).ConfigureAwait(false),
+        };
+        await strategy.StartAsync(context, ct).ConfigureAwait(false);
+        log?.Invoke(strategy.Describe);
+        foreach (var extra in strategy.ExtraSockets)
+        {
+            SilenceIcmpResets(extra);
+            extras.Add(extra);
+            var mineSocket = extra;
+            receivers.Add(Task.Run(() => ReceiveLoopAsync(mineSocket), stop.Token));
+        }
 
         while (DateTimeOffset.UtcNow < deadline && !success.Task.IsCompleted && !ct.IsCancellationRequested)
         {
-            foreach (var candidate in exact)
-            {
-                sent += await SendPunchAsync(socket, candidate, session, secret, outstanding, ct)
-                    .ConfigureAwait(false);
-                // 诱饵只朝**准确地址**发，不参与扫描：它们存在的意义是多开几个不同的
-                // 外部端口让对端的扫描有机会撞上，而不是自己去搜。
-                foreach (var decoy in decoys)
-                    sent += await SendPunchAsync(decoy, candidate, session, secret, outstanding, ct)
-                        .ConfigureAwait(false);
-            }
-
-            if (bothSymmetric && pools.Count > 0)
-            {
-                for (var k = 0; k < SymmetricFlowsPerRound; k++, symmetricIndex++)
-                {
-                    var pool = pools[symmetricIndex % pools.Count];
-                    var port = pool.Port + 1 + symmetricIndex / pools.Count + Random.Shared.Next(DriftSpread + 1);
-                    if (port > 65535) continue;
-                    var target = new IPEndPoint(pool.Address, port);
-                    symmetricTargets.Add(target);
-                    sent += await SendPunchAsync(socket, target, session, secret, outstanding, ct).ConfigureAwait(false);
-                }
-                for (var k = 0; k < SymmetricResendPerRound && symmetricTargets.Count > SymmetricFlowsPerRound; k++)
-                {
-                    var target = symmetricTargets[Random.Shared.Next(symmetricTargets.Count - SymmetricFlowsPerRound)];
-                    sent += await SendPunchAsync(socket, target, session, secret, outstanding, ct).ConfigureAwait(false);
-                }
-            }
-
-            // 准确地址打不通，才展开端口扫描。IPv6 没有 NAT，扫了也没意义。
-            //
-            // 但对端明显是对称型时，"准确地址"根本不存在——它报上来的端口是它探反射器
-            // 时的映射，朝我们发包用的是另一个。那种情况下先等 1.5 秒纯属白等，实测
-            // 蜂窝端的打洞耗时里有 1.5 秒就是这么来的（总耗时 1.9~2.1 秒）。
-            if (sweepPorts && DateTimeOffset.UtcNow - started > sweepAfter)
-            {
-                foreach (var candidate in peerCandidates)
-                {
-                    if (candidate.AddressFamily != AddressFamily.InterNetwork) continue;
-                    for (var i = 0; i < SweepPerRound; i++)
-                    {
-                        var offset = sweepCursor++ % (SweepBelow + SweepAbove) - SweepBelow;
-                        if (offset == 0) continue;
-                        var port = candidate.Port + offset;
-                        if (port is < 1 or > 65535) continue;
-                        sent += await SendPunchAsync(socket,
-                            new IPEndPoint(candidate.Address, port), session, secret, outstanding, ct)
-                            .ConfigureAwait(false);
-                    }
-                }
-            }
-
+            await strategy.TickAsync(context, ct).ConfigureAwait(false);
             var finished = await Task.WhenAny(success.Task, Task.Delay(SendInterval, ct))
                 .ConfigureAwait(false);
             if (finished == success.Task) break;
@@ -494,7 +325,7 @@ public static class UdpPuncher
         }
 
         // 应答方开了诱饵：等对端表态它用的是哪一对，理由见 PeerChoiceWait。
-        if (awaitPeerChoice && decoys.Count > 0 && success.Task.IsCompletedSuccessfully)
+        if (awaitPeerChoice && extras.Count > 0 && success.Task.IsCompletedSuccessfully)
         {
             var until = DateTimeOffset.UtcNow + PeerChoiceWait;
             while (Volatile.Read(ref peerDone) == 0 && DateTimeOffset.UtcNow < until
@@ -553,7 +384,7 @@ public static class UdpPuncher
 
         // 没赢的诱饵全部收掉。必须在 winner 定下来之后再收——兜底路径可能把 winner
         // 指到某个诱饵上，先收就把刚打通的那个洞关了。
-        foreach (var decoy in decoys)
+        foreach (var decoy in extras)
             if (!ReferenceEquals(decoy, winner))
                 try { decoy.Close(); } catch { }
 
@@ -567,34 +398,6 @@ public static class UdpPuncher
     }
 
     /// <summary>发一个探路包，登记 nonce 好认回来的 Ack。发失败当没发过。</summary>
-    /// <summary>
-    /// 对端报上来的端口按"池"分组，每组取最大的那个作起点。
-    ///
-    /// 有的 NAT 同时从两段端口里交替分配（实测手机热点 348xx 和 350xx 两段轮流），
-    /// 预测时两段各走各的序列。相距 64 以内的算同一段。
-    /// </summary>
-    internal static List<IPEndPoint> PortPools(IReadOnlyList<IPEndPoint> candidates)
-    {
-        var pools = new List<IPEndPoint>();
-        foreach (var group in candidates.Where(c => c.AddressFamily == AddressFamily.InterNetwork)
-                     .GroupBy(c => c.Address))
-        {
-            var ports = group.Select(c => c.Port).Distinct().OrderBy(p => p).ToList();
-            if (ports.Count < 2) continue;
-            var top = ports[0];
-            for (var i = 1; i < ports.Count; i++)
-            {
-                if (ports[i] - ports[i - 1] > 64)
-                {
-                    pools.Add(new IPEndPoint(group.Key, top));
-                }
-                top = ports[i];
-            }
-            pools.Add(new IPEndPoint(group.Key, top));
-        }
-        return pools;
-    }
-
     private static async Task<int> SendPunchAsync(
         Socket socket, IPEndPoint target, ulong session, byte[] secret,
         ConcurrentDictionary<ulong, byte> outstanding, CancellationToken ct)

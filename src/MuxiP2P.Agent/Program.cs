@@ -333,8 +333,12 @@ internal static class Program
         return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
     }
 
-    internal static void Log(string message) =>
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] {message}");
+    internal static void Log(string message)
+    {
+        var line = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
+        Console.WriteLine(line);
+        AgentLog.Write(line);
+    }
 }
 
 /// <summary>
@@ -372,5 +376,58 @@ internal sealed class SessionTable
     public void Drop(ulong id)
     {
         lock (_gate) _sessions.Remove(id);
+    }
+}
+
+/// <summary>
+/// agent 模式的日志文件。原先只写 stdout，而宿主（Agent Nexus）只在调试级别记它——应答方
+/// 那一半打洞日志从来看不到，两边对不上账。
+///
+/// 写到 MUXI_AGENT_LOG 指定的文件；没设但 exe 旁边已经有 muxi-p2p-agent.log 时也写进去
+/// （建一个空文件就能在不重启宿主的情况下打开它）。超过 4 MB 换到 .1，只留一份旧的。
+/// </summary>
+internal static class AgentLog
+{
+    private const long MaxBytes = 4 * 1024 * 1024;
+    private static readonly object Gate = new();
+    private static StreamWriter? _writer;
+    private static string? _path;
+    private static bool _resolved;
+
+    public static void Write(string line)
+    {
+        lock (Gate)
+        {
+            try
+            {
+                if (!_resolved)
+                {
+                    _resolved = true;
+                    var configured = Environment.GetEnvironmentVariable("MUXI_AGENT_LOG");
+                    var beside = Path.Combine(AppContext.BaseDirectory, "muxi-p2p-agent.log");
+                    _path = !string.IsNullOrWhiteSpace(configured) ? configured
+                        : File.Exists(beside) ? beside : null;
+                    if (_path is not null) Open();
+                }
+                if (_writer is null) return;
+                _writer.WriteLine(line);
+                if (_writer.BaseStream.Length > MaxBytes)
+                {
+                    _writer.Dispose();
+                    _writer = null;
+                    File.Move(_path!, _path + ".1", overwrite: true);
+                    Open();
+                }
+            }
+            catch { /* 日志失败不影响打洞 */ }
+        }
+    }
+
+    private static void Open()
+    {
+        var dir = Path.GetDirectoryName(_path);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+        var stream = new FileStream(_path!, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+        _writer = new StreamWriter(stream, new System.Text.UTF8Encoding(false)) { AutoFlush = true };
     }
 }
