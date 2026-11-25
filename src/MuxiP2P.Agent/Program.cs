@@ -26,6 +26,7 @@ internal static class Program
 
         // `muxi-p2p-agent connect ...`: the connecting side as a local port forwarder (Connect.cs).
         if (args.Length > 0 && args[0] == "connect") return await Connect.RunAsync(args[1..]).ConfigureAwait(false);
+        if (args.Length > 0 && args[0] == "selftest") return await SelfTest.RunAsync().ConfigureAwait(false);
 
         var listenPort = int.Parse(Value(args, "--port") ?? "25540");
         var target = Value(args, "--target") ?? "127.0.0.1:25565";
