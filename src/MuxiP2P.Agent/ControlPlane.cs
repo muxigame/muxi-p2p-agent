@@ -309,17 +309,30 @@ internal sealed class ControlPlane
 
     private async Task<RegisterResponse> RegisterAsync(List<string> endpoints, CancellationToken ct)
     {
-        var payload = JsonSerializer.SerializeToUtf8Bytes(new
+        // Written by hand, not by reflection: the Android build is NativeAOT (see Connect.Emit).
+        byte[] payload;
+        using (var buffer = new MemoryStream())
         {
-            serverId = _serverId,
-            tunnelPort = _tunnelPort,
-            mcPort = _mcPort,
-            endpoints,
-            // 打洞用的出口候选，和上面那组 TCP 入口地址是两回事
-            udpCandidates = _udpCandidates(),
-            // 路由器给的入站映射（PCP/NAT-PMP/UPnP）。没有就是 null，控制面会跳过。
-            mappedEndpoint = _mapped,
-        });
+            using (var json = new Utf8JsonWriter(buffer))
+            {
+                json.WriteStartObject();
+                json.WriteString("serverId", _serverId);
+                json.WriteNumber("tunnelPort", _tunnelPort);
+                json.WriteNumber("mcPort", _mcPort);
+                json.WriteStartArray("endpoints");
+                foreach (var endpoint in endpoints) json.WriteStringValue(endpoint);
+                json.WriteEndArray();
+                // 打洞用的出口候选，和上面那组 TCP 入口地址是两回事
+                json.WriteStartArray("udpCandidates");
+                foreach (var candidate in _udpCandidates()) json.WriteStringValue(candidate);
+                json.WriteEndArray();
+                // 路由器给的入站映射（PCP/NAT-PMP/UPnP）。没有就是 null，控制面会跳过。
+                if (_mapped is null) json.WriteNull("mappedEndpoint");
+                else json.WriteString("mappedEndpoint", _mapped.ToString());
+                json.WriteEndObject();
+            }
+            payload = buffer.ToArray();
+        }
         var stamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
         var timestamp = stamp.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
 

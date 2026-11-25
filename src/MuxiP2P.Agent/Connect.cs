@@ -30,7 +30,7 @@ internal static class Connect
         var directOnly = args.Contains("--no-punch");
         if (string.IsNullOrWhiteSpace(controlPlane) || string.IsNullOrWhiteSpace(serverId))
         {
-            Emit(new { @event = "error", error = "connect needs --control-plane and --server-id" });
+            Emit("error", ("error", "connect needs --control-plane and --server-id"));
             return 2;
         }
         ControlPlaneClient.SetHeaders(Headers(args));
@@ -43,7 +43,7 @@ internal static class Connect
         Egress.Log = message =>
         {
             Log.Info(message);
-            Emit(new { @event = "progress", text = message });
+            Emit("progress", ("text", message));
         };
 
         using var lifetime = new CancellationTokenSource();
@@ -62,12 +62,12 @@ internal static class Connect
         }
         catch (Exception error) when (error is not OperationCanceledException)
         {
-            Emit(new { @event = "error", error = error.Message });
+            Emit("error", ("error", error.Message));
             return 3;
         }
         if (tunnel is null)
         {
-            Emit(new { @event = "error", error = "no route to the device" });
+            Emit("error", ("error", "no route to the device"));
             return 3;
         }
 
@@ -75,7 +75,7 @@ internal static class Connect
         var listener = new TcpListener(endpoint);
         listener.Start(64);
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        Emit(new { @event = "ready", port, route = tunnel.Describe });
+        Emit("ready", ("port", port), ("route", tunnel.Describe));
 
         var watch = Task.Run(async () =>
         {
@@ -100,7 +100,7 @@ internal static class Connect
         P2PTunnel.DisposeInBackground(tunnel);
         if (lost)
         {
-            Emit(new { @event = "lost" });
+            Emit("lost");
             return 4;
         }
         return 0;
@@ -164,7 +164,7 @@ internal static class Connect
 
         // 2. Hole punching through the reflectors and the control plane's rendezvous.
         if (string.IsNullOrWhiteSpace(reflector)) throw new InvalidOperationException("no direct route and no --reflector to punch with");
-        var progress = new Progress<string>(text => Emit(new { @event = "progress", text }));
+        var progress = new Progress<string>(text => Emit("progress", ("text", text)));
         return await P2PTunnel.EstablishAsync(controlPlane, serverId, token, reflector, progress, ct).ConfigureAwait(false);
     }
 
@@ -185,7 +185,7 @@ internal static class Connect
                 catch (Exception error) when (!ct.IsCancellationRequested)
                 {
                     // 这个地址不通，或者那头不是它（鉴权失败）：换下一个，别让整次连接失败
-                    Emit(new { @event = "progress", text = $"直连 {address} 未成功：{error.Message}" });
+                    Emit("progress", ("text", $"直连 {address} 未成功：{error.Message}"));
                 }
             }
         }
@@ -257,9 +257,32 @@ internal static class Connect
 
     private static readonly object EmitLock = new();
 
-    internal static void Emit(object payload)
+    /// <summary>
+    /// One JSON line on stdout for the host (Agent Nexus): {"event": ..., fields...}. Written by
+    /// hand, not by reflection: the Android build is NativeAOT, where reflection-based
+    /// serialization is off and an anonymous object would throw at run time.
+    /// </summary>
+    internal static void Emit(string @event, params (string Name, object? Value)[] fields)
     {
-        var line = JsonSerializer.Serialize(payload);
+        using var buffer = new MemoryStream();
+        using (var json = new Utf8JsonWriter(buffer))
+        {
+            json.WriteStartObject();
+            json.WriteString("event", @event);
+            foreach (var (name, value) in fields)
+            {
+                switch (value)
+                {
+                    case null: json.WriteNull(name); break;
+                    case int number: json.WriteNumber(name, number); break;
+                    case long number: json.WriteNumber(name, number); break;
+                    case bool flag: json.WriteBoolean(name, flag); break;
+                    default: json.WriteString(name, value.ToString()); break;
+                }
+            }
+            json.WriteEndObject();
+        }
+        var line = Encoding.UTF8.GetString(buffer.ToArray());
         lock (EmitLock)
         {
             Console.Out.WriteLine(line);
